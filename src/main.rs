@@ -25,6 +25,31 @@ const GRID_SIZE: u32 = 256;
 const SCALING: u32 = 8;
 const MAX_CHARGE: u32 = 16;
 
+// https://nullprogram.com/blog/2018/07/31/
+#[tracked]
+fn hash(x: Expr<u32>) -> Expr<u32> {
+    let x = x.var();
+    *x ^= x >> 17;
+    *x *= 0xed5ad4bb;
+    *x ^= x >> 11;
+    *x *= 0xac4c1b51;
+    *x ^= x >> 15;
+    *x *= 0x31848bab;
+    *x ^= x >> 14;
+    **x
+}
+
+#[tracked]
+fn rand(pos: Expr<Vec2<u32>>, t: Expr<u32>, c: u32) -> Expr<u32> {
+    let input = t + pos.x * GRID_SIZE + pos.y * GRID_SIZE * GRID_SIZE + c * 1063; //* GRID_SIZE * GRID_SIZE * GRID_SIZE;
+    hash(input)
+}
+
+#[tracked]
+fn rand_f32(pos: Expr<Vec2<u32>>, t: Expr<u32>, c: u32) -> Expr<f32> {
+    rand(pos, t, c).as_f32() / u32::MAX as f32
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Runtime {
     cursor_pos: PhysicalPosition<f64>,
@@ -77,17 +102,22 @@ fn main() {
 
     let domain = GridDomain::new([0, 0], [GRID_SIZE; 2]);
 
-    let nearest_ground: VField<Vec2<i32>, Vec2<i32>> = fields.create_bind(
-        "nearest-ground",
+    let aq: VField<f32, Vec2<i32>> = fields.create_bind(
+        "air-quality",
+        domain.map_texture(device.create_tex2d(PixelStorage::Float1, GRID_SIZE, GRID_SIZE, 1)),
+    );
+
+    let finder: VField<Vec2<i32>, Vec2<i32>> = fields.create_bind(
+        "finder",
         domain.map_texture(device.create_tex2d(PixelStorage::Int2, GRID_SIZE, GRID_SIZE, 1)),
     );
     let valid: VField<bool, Vec2<i32>> = *fields.create_bind(
-        "ground",
+        "valid",
         domain.map_buffer_morton(device.create_buffer(GRID_SIZE as usize * GRID_SIZE as usize)),
     );
-    let nearest_ground_finder: VField<Vec2<i32>, Vec2<i32>> = fields.create_bind(
-        "nearest-ground",
-        domain.map_texture(device.create_tex2d(PixelStorage::Int2, GRID_SIZE, GRID_SIZE, 1)),
+    let dist: VField<f32, Vec2<i32>> = fields.create_bind(
+        "dist",
+        domain.map_texture(device.create_tex2d(PixelStorage::Float1, GRID_SIZE, GRID_SIZE, 1)),
     );
     let charge: AField<u32, Vec2<i32>> = fields.create_bind(
         "charge",
@@ -110,36 +140,36 @@ fn main() {
             let pos = (*display_el / SCALING).cast_i32();
             let mut el = domain.index(pos, &display_el);
             let color = if el.expr(&ground) {
-                Vec3::splat_expr(1.0_f32)
+                Vec3::splat_expr(0.0_f32)
             } else {
                 if el.expr(&charge) != 0 {
-                    Vec3::expr(0.5, 0.5, 0.0)
-                } else if el.expr(&valid) {
-                    Vec3::expr(0.0, 0.0, 0.2)
+                    Vec3::expr(1.0, 0.9, 0.2)
                 } else {
-                    Vec3::expr(0.0, 0.0, 0.0)
+                    Vec3::splat(0.9) * el.expr(&aq)
                 }
-                // let c = el.expr(&charge).cast_f32() / MAX_CHARGE as f32;
-                // Vec3::expr(1.0, 0.9, 0.2) * c
+                // let c =
             };
             *display_el.var(&display) = color.extend(1.0);
         }),
     );
 
-    let update_valid = Kernel::<fn()>::build(
+    let init_aq = Kernel::<fn()>::build(
         &device,
         &domain,
         track!(&|mut el| {
-            *el.var(&valid) = domain.index(el.expr(&nearest_ground), &el).expr(&ground);
+            *el.var(&aq) = rand_f32(el.cast_u32(), 0.expr(), 0) * 0.1
+                + rand_f32((*el / 2_i32).cast_u32(), 0.expr(), 1) * 0.1
+                + rand_f32((*el / 4_i32).cast_u32(), 0.expr(), 4) * 0.1
+                + 1.0;
         }),
     );
 
-    let init_nearest_ground = Kernel::<fn()>::build(
+    let init_finders = Kernel::<fn()>::build(
         &device,
         &domain,
         track!(&|mut el| {
-            *el.var(&nearest_ground) = *el;
-            *el.var(&nearest_ground_finder) = *el;
+            *el.var(&dist) = f32::MAX;
+            *el.var(&finder) = *el;
         }),
     );
 
@@ -147,45 +177,26 @@ fn main() {
         &device,
         &domain,
         track!(&|mut el| {
-            let best_dist = i32::MAX.var();
-            let best_ground = (*el).var();
-            let old_ground_finder = el.expr(&nearest_ground_finder);
-            let best_ground_finder = (*el).var();
-            let pos = *el;
+            let is_valid = el.expr(&valid).var();
+            let best_dist = el.expr(&dist).var();
+            let best_finder = el.expr(&finder).var();
+            if el.expr(&ground) {
+                *best_dist = 0.0;
+                *best_finder = *el;
+                *is_valid = true;
+            }
             domain.on_adjacent(&el, |mut el| {
-                let ground = el.expr(&nearest_ground);
-                let valid = el.expr(&valid);
-                if valid {
-                    let delta = ground - *el;
-                    let dist = delta.x * delta.x + delta.y * delta.y + 1;
-                    if dist < best_dist {
-                        *best_dist = dist;
-                        *best_ground = ground;
-                        *best_ground_finder = *el;
-                    }
+                let this_valid = el.expr(&valid);
+                let dist = (el.expr(&dist) + 1.0) * el.expr(&aq);
+                if this_valid && (!is_valid || dist < best_dist) {
+                    *best_dist = dist;
+                    *best_finder = *el;
+                    *is_valid = true;
                 }
             });
-            let ground = el.expr(&nearest_ground);
-            let valid = el.expr(&valid);
-            if valid {
-                let delta = ground - pos;
-                let dist = delta.x * delta.x + delta.y * delta.y;
-                if dist < best_dist {
-                    *best_dist = dist;
-                    *best_ground = ground;
-                    *best_ground_finder = old_ground_finder;
-                }
-            }
-            // if el.expr(&value) < IMF_CAP / 2 {
-            //     *best_dist = 0;
-            //     *best_ground = pos;
-            // }
-            // TODO: Also check the current out to see if it's also good?
-            if best_dist == i32::MAX {
-                return;
-            }
-            *el.var(&nearest_ground) = best_ground;
-            *el.var(&nearest_ground_finder) = best_ground_finder;
+            *el.var(&dist) = best_dist;
+            *el.var(&finder) = best_finder;
+            *el.var(&valid) = is_valid;
         }),
     );
 
@@ -201,16 +212,17 @@ fn main() {
                 return;
             }
             if el.expr(&ground) {
-                el.atomic(&next_charge).fetch_sub(1);
+                el.atomic(&next_charge).fetch_min(0);
                 return;
             }
-            let finder = el.expr(&nearest_ground_finder);
+            let finder = el.expr(&finder);
             if (finder != pos).any() {
                 // safety
                 let mut fel = domain.index(finder, &el);
                 if fel.expr(&charge) < MAX_CHARGE {
-                    fel.atomic(&next_charge).fetch_add(1);
-                    el.atomic(&next_charge).fetch_sub(1);
+                    let fill = 1; // luisa::min(MAX_CHARGE - fel.expr(&charge), el.expr(&charge));
+                    fel.atomic(&next_charge).fetch_add(fill);
+                    el.atomic(&next_charge).fetch_sub(fill);
                 }
             }
         }),
@@ -246,7 +258,7 @@ fn main() {
     );
 
     let mut graph = ComputeGraph::new(&device);
-    graph.add((init_nearest_ground.dispatch(), update_valid.dispatch()).chain());
+    graph.add((init_finders.dispatch(), init_aq.dispatch()).chain());
     graph.execute_clear();
 
     let mut active_buttons = HashSet::new();
@@ -291,7 +303,6 @@ fn main() {
                     graph.add(
                         (
                             propegate_nearest.dispatch(),
-                            update_valid.dispatch(),
                             discharge.dispatch(),
                             copy_charge.dispatch(),
                             draw_kernel.dispatch(),
