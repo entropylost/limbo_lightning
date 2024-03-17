@@ -1694,8 +1694,10 @@ dependencies = [
 name = "sefirot_macro"
 version = "0.1.0"
 dependencies = [
+ "proc-macro-error",
  "proc-macro2",
  "quote",
+ "syn 2.0.52",
 ]
 
 [[package]]

@@ -100,7 +100,7 @@ fn main() {
     let display: VField<Vec4<f32>, Vec2<u32>> =
         fields.create_bind("display", display_domain.map_tex2d(display_texture.view(0)));
 
-    let domain = GridDomain::new([0, 0], [GRID_SIZE; 2]);
+    let domain = GridDomain::new_wrapping([0, 0], [GRID_SIZE; 2]);
 
     let aq: VField<f32, Vec2<i32>> = fields.create_bind(
         "air-quality",
@@ -136,28 +136,28 @@ fn main() {
     let draw_kernel = Kernel::<fn()>::build(
         &device,
         &display_domain,
-        track!(&|mut display_el| {
+        track!(&|display_el| {
             let pos = (*display_el / SCALING).cast_i32();
-            let mut el = domain.index(pos, &display_el);
-            let color = if el.expr(&ground) {
+            let el = domain.index(pos, &display_el);
+            let color = if ground.expr(&el) {
                 Vec3::splat_expr(0.0_f32)
             } else {
-                if el.expr(&charge) != 0 {
+                if charge.expr(&el) != 0 {
                     Vec3::expr(1.0, 0.9, 0.2)
                 } else {
-                    Vec3::splat(0.9) * el.expr(&aq)
+                    Vec3::splat(0.9) * aq.expr(&el)
                 }
                 // let c =
             };
-            *display_el.var(&display) = color.extend(1.0);
+            *display.var(&display_el) = color.extend(1.0);
         }),
     );
 
     let init_aq = Kernel::<fn()>::build(
         &device,
         &domain,
-        track!(&|mut el| {
-            *el.var(&aq) = rand_f32(el.cast_u32(), 0.expr(), 0) * 0.1
+        track!(&|el| {
+            *aq.var(&el) = rand_f32(el.cast_u32(), 0.expr(), 0) * 0.1
                 + rand_f32((*el / 2_i32).cast_u32(), 0.expr(), 1) * 0.1
                 + rand_f32((*el / 4_i32).cast_u32(), 0.expr(), 4) * 0.1
                 + 1.0;
@@ -167,62 +167,62 @@ fn main() {
     let init_finders = Kernel::<fn()>::build(
         &device,
         &domain,
-        track!(&|mut el| {
-            *el.var(&dist) = f32::MAX;
-            *el.var(&finder) = *el;
+        track!(&|el| {
+            *dist.var(&el) = f32::MAX;
+            *finder.var(&el) = *el;
         }),
     );
 
     let propegate_nearest = Kernel::<fn()>::build(
         &device,
         &domain,
-        track!(&|mut el| {
-            let is_valid = el.expr(&valid).var();
-            let best_dist = el.expr(&dist).var();
-            let best_finder = el.expr(&finder).var();
-            if el.expr(&ground) {
+        track!(&|el| {
+            let is_valid = valid.expr(&el).var();
+            let best_dist = dist.expr(&el).var();
+            let best_finder = finder.expr(&el).var();
+            if ground.expr(&el) {
                 *best_dist = 0.0;
                 *best_finder = *el;
                 *is_valid = true;
             }
-            domain.on_adjacent(&el, |mut el| {
-                let this_valid = el.expr(&valid);
-                let dist = (el.expr(&dist) + 1.0) * el.expr(&aq);
+            domain.on_adjacent(&el, |el| {
+                let this_valid = valid.expr(&el);
+                let dist = (dist.expr(&el) + 1.0) * aq.expr(&el);
                 if this_valid && (!is_valid || dist < best_dist) {
                     *best_dist = dist;
                     *best_finder = *el;
                     *is_valid = true;
                 }
             });
-            *el.var(&dist) = best_dist;
-            *el.var(&finder) = best_finder;
-            *el.var(&valid) = is_valid;
+            *dist.var(&el) = best_dist;
+            *finder.var(&el) = best_finder;
+            *valid.var(&el) = is_valid;
         }),
     );
 
     let discharge = Kernel::<fn()>::build(
         &device,
         &domain,
-        track!(&|mut el| {
+        track!(&|el| {
             let pos = *el;
-            if el.expr(&charge) == 0 {
+            if charge.expr(&el) == 0 {
                 return;
             }
-            if !el.expr(&valid) {
+            if !valid.expr(&el) {
                 return;
             }
-            if el.expr(&ground) {
-                el.atomic(&next_charge).fetch_min(0);
+            if ground.expr(&el) {
+                next_charge.atomic(&el).fetch_min(0);
                 return;
             }
-            let finder = el.expr(&finder);
+            let finder = finder.expr(&el);
             if (finder != pos).any() {
                 // safety
-                let mut fel = domain.index(finder, &el);
-                if fel.expr(&charge) < MAX_CHARGE {
+                let fel = domain.index(finder, &el);
+                if charge.expr(&fel) < MAX_CHARGE {
                     let fill = 1; // luisa::min(MAX_CHARGE - fel.expr(&charge), el.expr(&charge));
-                    fel.atomic(&next_charge).fetch_add(fill);
-                    el.atomic(&next_charge).fetch_sub(fill);
+                    next_charge.atomic(&fel).fetch_add(fill);
+                    next_charge.atomic(&el).fetch_sub(fill);
                 }
             }
         }),
@@ -230,30 +230,30 @@ fn main() {
     let copy_charge = Kernel::<fn()>::build(
         &device,
         &domain,
-        track!(&|mut el| {
-            *el.var(&charge) = el.expr(&next_charge);
+        track!(&|el| {
+            *charge.var(&el) = next_charge.expr(&el);
         }),
     );
 
     let write_wall = Kernel::<fn(Vec2<i32>)>::build(
         &device,
         &domain,
-        track!(&|mut el, pos| {
+        track!(&|el, pos| {
             if (*el != pos).any() {
                 return;
             }
-            *el.var(&ground) = true;
+            *ground.var(&el) = true;
         }),
     );
     let write_charge = Kernel::<fn(Vec2<i32>, u32)>::build(
         &device,
         &domain,
-        track!(&|mut el, pos, c| {
+        track!(&|el, pos, c| {
             if (*el != pos).any() {
                 return;
             }
-            *el.var(&charge) = c;
-            *el.var(&next_charge) = c;
+            *charge.var(&el) = c;
+            *next_charge.var(&el) = c;
         }),
     );
 
